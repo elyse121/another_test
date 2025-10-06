@@ -8,7 +8,7 @@ urlpatterns = [
     path('logout/', views.logout_page, name="logout"),
     path('signup/', views.signup_view, name="signup"),
     path('chatter/', views.home_page, name="home"),
-    path('verify/', views.verify_email, name="verify-email"),  # New route
+    path('verify/', views.verify_email, name="verify_email"),  # Fixed name to match reverse('verify_email')
 
     # Post-related pages
     path('posts/', views.posts_page, name='posts'),

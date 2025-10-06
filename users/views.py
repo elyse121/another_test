@@ -3,20 +3,32 @@ from django.contrib.auth.decorators import login_required
 from django.contrib.auth.models import User
 from django.contrib.auth import authenticate, login, logout
 from django.contrib import messages
+from django.contrib.sites.shortcuts import get_current_site
+from django.urls import reverse
 from django.core.files.storage import FileSystemStorage
 from django.http import JsonResponse
 from django.views.decorators.http import require_POST
-from django.core.mail import send_mail
+from django.core.mail import send_mail, EmailMultiAlternatives
 from django.utils import timezone
 from datetime import timedelta
 from django.views.decorators.csrf import csrf_exempt
+from django.template.loader import render_to_string
+from django.utils.html import strip_tags
+from django.conf import settings
+from django.contrib.sessions.models import Session
 from chat.models import Message
+from dashboard.models import ManageMember, Notification
 
 import random
 import string
 import json
+import requests
+import logging
 
 from .models import Post, Like, Comment, UserProfile, Memory, TunnelSession, TunnelOTP
+
+# Set up logger
+logger = logging.getLogger(__name__)
 
 # --------------------
 # HELPER
@@ -37,33 +49,11 @@ def generate_profile_code():
 def index_page(request):
     return render(request, 'index.html')
 
-"""def login_page(request):
-    if request.method == 'POST':
-        username = request.POST.get('username')
-        password = request.POST.get('password')
-        user = authenticate(request, username=username, password=password)
-        if user:
-            login(request, user)
-            messages.success(request, 'Login successful!')
-            return redirect('posts')
-        else:
-            messages.error(request, 'Invalid username or password.')
-    if request.user.is_authenticated:
-        return redirect('posts')
-    return render(request, 'login.html')"""
-
-    # --- LOGIN ---
-from django.contrib.auth import authenticate, login
-from django.shortcuts import render, redirect
-from django.contrib import messages
-
 def login_page(request):
     if request.method == 'POST':
         username = request.POST.get('username')
         password = request.POST.get('password')
-
         user = authenticate(request, username=username, password=password)
-
         if user:
             # Check if banned
             if getattr(user, 'is_banned', False):
@@ -71,48 +61,47 @@ def login_page(request):
                 return redirect('banned_account_page')
 
             # Check if user is active
-            if user.is_active:
-                login(request, user)
-                messages.success(request, 'Login successful!')
-
-                # Redirect based on permissions
-                if user.is_active and user.is_staff and user.is_superuser:
-                    return redirect('dashindex')   # Admin dashboard
-                else:
-                    return redirect('posts')       # Normal user page
-            else:
+            if not user.is_active:
                 messages.error(request, "This account is inactive. Please contact admin.")
-        else:
-            messages.error(request, 'Invalid username or password.')
-
-        # Modified login view to check verification
-    if request.method == 'POST':
-        username = request.POST.get('username')
-        password = request.POST.get('password')
-        user = authenticate(request, username=username, password=password)
-        if user:
-            user_profile = UserProfile.objects.get(user=user)
-            if not user_profile.is_verified:
-                messages.error(request, 'Please verify your email before logging in.')
                 return render(request, 'login.html')
+
+            # Check verification
+            try:
+                user_profile = UserProfile.objects.get(user=user)
+                if not user_profile.is_verified:
+                    messages.error(request, 'Please verify your email before logging in.')
+                    return render(request, 'login.html')
+            except UserProfile.DoesNotExist:
+                messages.error(request, 'User profile not found. Please contact admin.')
+                return render(request, 'login.html')
+
             login(request, user)
             messages.success(request, 'Login successful!')
-            return redirect('posts')
+
+            # Redirect based on permissions
+            if user.is_staff and user.is_superuser:
+                return redirect('dashindex')   # Admin dashboard
+            else:
+                return redirect('posts')       # Normal user page
         else:
             messages.error(request, 'Invalid username or password.')
-    if request.user.is_authenticated:
-        return redirect('posts')
-    
+            return render(request, 'login.html')
+
     # Already logged-in users
     if request.user.is_authenticated:
         if getattr(request.user, 'is_banned', False):
             messages.error(request, "Your account is banned.")
             return redirect('banned_account_page')
 
-        if request.user.is_active:
-            return redirect('dashindex' if request.user.is_staff and request.user.is_superuser else 'index')
-        else:
+        if not request.user.is_active:
             messages.error(request, "Your account is inactive. Please contact admin.")
+            return render(request, 'login.html')
+
+        # Redirect based on permissions
+        if request.user.is_staff and request.user.is_superuser:
+            return redirect('dashindex')
+        else:
+            return redirect('posts')
 
     return render(request, 'login.html')
 
@@ -123,21 +112,8 @@ def logout_page(request):
     return redirect('/')
 
 # --------------------
-# HELPER
-# --------------------
-def generate_profile_code():
-    return (
-        random.choice(string.ascii_uppercase) +
-        str(random.randint(1, 9)) +
-        '-' +
-        ''.join(random.choices(string.ascii_uppercase + string.digits, k=2)) +
-        '-' +
-        ''.join(random.choices(string.ascii_uppercase + string.digits, k=2))
-    )
-
-# --------------------
-# SIGNUP + VERIFICATION
-# --------------------
+# SIGNUP + VERIFICATION (FIXED FOR REAL EMAIL SENDING)
+# -------------------
 def signup_view(request):
     if request.method == 'POST':
         email = request.POST.get('email')
@@ -146,58 +122,112 @@ def signup_view(request):
         confirm_password = request.POST.get('confirm_password')
         profile_picture = request.FILES.get('profile_picture')
 
+        # Validation checks
+        if not all([email, username, password1, confirm_password]):
+            error_msg = "All fields are required"
+            if request.headers.get("x-requested-with") == "XMLHttpRequest":
+                return JsonResponse({"success": False, "message": error_msg})
+            messages.error(request, error_msg)
+            return render(request, 'signup.html')
+
         # Password check
         if password1 != confirm_password:
+            error_msg = "Passwords do not match"
             if request.headers.get("x-requested-with") == "XMLHttpRequest":
-                return JsonResponse({"success": False, "message": "Passwords do not match"})
-            messages.error(request, 'Passwords do not match.')
+                return JsonResponse({"success": False, "message": error_msg})
+            messages.error(request, error_msg)
             return render(request, 'signup.html')
 
         # Email uniqueness check
         if User.objects.filter(email=email).exists():
+            error_msg = "Email is already in use"
             if request.headers.get("x-requested-with") == "XMLHttpRequest":
-                return JsonResponse({"success": False, "message": "Email is already in use"})
-            messages.error(request, 'Email is already in use.')
+                return JsonResponse({"success": False, "message": error_msg})
+            messages.error(request, error_msg)
             return render(request, 'signup.html')
 
-        # Create user + profile
-        user = User.objects.create_user(username=username, email=email, password=password1)
-        user_profile, created = UserProfile.objects.get_or_create(user=user)
-        user_profile.profile_code = generate_profile_code()
-        user_profile.verification_token = user_profile.generate_verification_token()
-        if profile_picture:
-            user_profile.profile_picture = profile_picture
-        user_profile.save()
+        # Username uniqueness check
+        if User.objects.filter(username=username).exists():
+            error_msg = "Username is already taken"
+            if request.headers.get("x-requested-with") == "XMLHttpRequest":
+                return JsonResponse({"success": False, "message": error_msg})
+            messages.error(request, error_msg)
+            return render(request, 'signup.html')
 
-        # Build verification link
-        verification_link = f"http://127.0.0.1:8000/verify/?token={user_profile.verification_token}"
+        # Password strength check
+        if len(password1) < 8:
+            error_msg = "Password must be at least 8 characters long"
+            if request.headers.get("x-requested-with") == "XMLHttpRequest":
+                return JsonResponse({"success": False, "message": error_msg})
+            messages.error(request, error_msg)
+            return render(request, 'signup.html')
 
-        # Send email
-        send_mail(
-            subject="Verify Your Best Friends Portal Account",
-            message=(
-                f"Hello {username},\n\n"
-                f"Your profile code is: {user_profile.profile_code}\n\n"
-                f"Please verify your email by clicking this link: {verification_link}\n"
-                f"This link expires in 30 minutes."
-            ),
-            from_email="elyseniyonzima202@gmail.com",
-            recipient_list=[email],
-            fail_silently=False,
-        )
+        try:
+            # Create user
+            user = User.objects.create_user(
+                username=username, 
+                email=email, 
+                password=password1
+            )
+            
+            # Create user profile
+            user_profile, created = UserProfile.objects.get_or_create(user=user)
+            user_profile.profile_code = generate_profile_code()
+            user_profile.verification_token = user_profile.generate_verification_token()
+            
+            if profile_picture:
+                user_profile.profile_picture = profile_picture
+            
+            user_profile.save()
 
-        # Response (Ajax vs normal form)
-        if request.headers.get("x-requested-with") == "XMLHttpRequest":
-            return JsonResponse({'success': True, 'message': 'Please check your email to verify your account.'})
+            # Build dynamic verification link (WORKS ON RENDER)
+            current_site = request.get_host()
+            protocol = 'https'  # Render uses HTTPS
+            verification_link = f"{protocol}://{current_site}/verify/?token={user_profile.verification_token}"
 
-        messages.success(request, 'Signup successful! Please check your email to verify your account.')
-        return redirect('login')
+            # Send email with proper configuration
+            try:
+                send_mail(
+                    subject="Verify Your Best Friends Portal Account",
+                    message=(
+                        f"Hello {username},\n\n"
+                        f"Your profile code is: {user_profile.profile_code}\n\n"
+                        f"Please verify your email by clicking this link: {verification_link}\n"
+                        f"This link expires in 30 minutes."
+                    ),
+                    from_email=settings.DEFAULT_FROM_EMAIL,
+                    recipient_list=[email],
+                    fail_silently=False,
+                )
+                print(f"✅ Verification email sent to {email}")  # Will show in Render logs
+                
+            except Exception as e:
+                print(f"❌ Failed to send verification email: {str(e)}")
+                # Don't delete user, just show error
+                error_msg = "Account created but failed to send verification email. Please contact support."
+                if request.headers.get("x-requested-with") == "XMLHttpRequest":
+                    return JsonResponse({"success": False, "message": error_msg})
+                messages.error(request, error_msg)
+                return render(request, 'signup.html')
+
+            # Success response
+            if request.headers.get("x-requested-with") == "XMLHttpRequest":
+                return JsonResponse({'success': True, 'message': 'Please check your email to verify your account.'})
+
+            messages.success(request, 'Signup successful! Please check your email to verify your account.')
+            return redirect('login')
+
+        except Exception as e:
+            print(f"❌ Error during user creation: {str(e)}")
+            error_msg = "An error occurred during signup. Please try again."
+            if request.headers.get("x-requested-with") == "XMLHttpRequest":
+                return JsonResponse({"success": False, "message": error_msg})
+            messages.error(request, error_msg)
+            return render(request, 'signup.html')
 
     if request.user.is_authenticated:
         return redirect('posts')
     return render(request, 'signup.html')
-
-
 def verify_email(request):
     """Handle email verification"""
     token = request.GET.get('token')
@@ -215,7 +245,6 @@ def verify_email(request):
     except UserProfile.DoesNotExist:
         messages.error(request, 'Invalid or expired verification link.')
         return render(request, 'verify.html')
-
 
 @login_required
 def home_page(request):
@@ -317,7 +346,7 @@ def go_to_chat_with_user5(request):
     return redirect('chat', room_name=user5.username)
 
 # --------------------
-# PRIVATE TUNNEL
+# PRIVATE TUNNEL (UPDATED FOR REAL EMAIL)
 # --------------------
 @login_required
 def private_tunnel(request):
@@ -344,16 +373,31 @@ def initiate_tunnel(request):
 
         otp = TunnelOTP.objects.create(tunnel_session=tunnel)
 
-        send_mail(
-            subject="Private Tunnel Access Code",
-            message=f"Hello {recipient.username},\n{request.user.username} wants to chat with you.\nOTP: {otp.otp_code}\nValid for 5 minutes.",
-            from_email="elyseniyonzima202@gmail.com",
-            recipient_list=[recipient.email],
-            fail_silently=False,
-        )
+        # Build dynamic URL for OTP instructions
+        current_site = request.get_host()
+        protocol = 'https' if request.is_secure() else 'http'
+        
+        try:
+            send_mail(
+                subject="Private Tunnel Access Code",
+                message=(
+                    f"Hello {recipient.username},\n\n"
+                    f"{request.user.username} wants to chat with you in a private tunnel.\n\n"
+                    f"Your OTP: {otp.otp_code}\n"
+                    f"Valid for 5 minutes.\n\n"
+                    f"Visit: {protocol}://{current_site}/private-tunnel/ to enter the OTP."
+                ),
+                from_email=settings.DEFAULT_FROM_EMAIL,
+                recipient_list=[recipient.email],
+                fail_silently=False,
+            )
+        except Exception as e:
+            logger.error(f"Failed to send tunnel OTP email: {str(e)}")
+            return JsonResponse({'success': False, 'error': 'Failed to send OTP email'})
 
         return JsonResponse({'success': True, 'tunnel_id': tunnel.tunnel_id, 'chat_room_id': tunnel.chat_room_id})
     except Exception as e:
+        logger.error(f"Error initiating tunnel: {str(e)}")
         return JsonResponse({'success': False, 'error': str(e)})
 
 @login_required
@@ -365,14 +409,11 @@ def verify_tunnel_otp(request):
         otp_code = str(data.get('otp')).strip()
         tunnel_id = data.get('tunnel_id')
 
-        # Get the tunnel regardless of initiator or recipient
         tunnel = TunnelSession.objects.get(tunnel_id=tunnel_id)
 
-        # Check if the logged-in user is part of this tunnel
         if request.user not in [tunnel.initiator, tunnel.recipient]:
             return JsonResponse({'success': False, 'error': 'Access denied'})
 
-        # Get the latest unused OTP
         otp_obj = tunnel.otps.filter(is_used=False).latest('created_at')
 
         if not otp_obj or not otp_obj.is_valid():
@@ -392,8 +433,8 @@ def verify_tunnel_otp(request):
     except TunnelSession.DoesNotExist:
         return JsonResponse({'success': False, 'error': 'Tunnel not found'})
     except Exception as e:
+        logger.error(f"Error verifying tunnel OTP: {str(e)}")
         return JsonResponse({'success': False, 'error': str(e)})
-
 
 @login_required
 def tunnel_chat(request, chat_room_id):
@@ -409,7 +450,6 @@ def tunnel_chat(request, chat_room_id):
 
         other_user = tunnel_session.recipient if tunnel_session.initiator == request.user else tunnel_session.initiator
 
-        # Use your existing template name
         return render(request, 'tunner_chat.html', {
             'chat_room_id': chat_room_id,
             'other_user': other_user,
@@ -418,79 +458,6 @@ def tunnel_chat(request, chat_room_id):
 
     except TunnelSession.DoesNotExist:
         return JsonResponse({'success': False, 'error': 'Tunnel not found or inactive'})
-
-from django.shortcuts import render, redirect, get_object_or_404
-from django.contrib.auth.decorators import login_required
-from django.contrib.auth.models import User
-from django.contrib.auth import authenticate, login, logout
-from django.contrib import messages
-from django.core.files.storage import FileSystemStorage
-from django.http import JsonResponse
-from django.views.decorators.http import require_POST
-from django.core.mail import send_mail
-from django.utils import timezone
-from datetime import timedelta
-from django.views.decorators.csrf import csrf_exempt
-import random
-import string
-import json
-
-from .models import Post, Like, Comment, UserProfile, Memory, TunnelSession, TunnelOTP
-
-# Helper function (already in your code)
-def generate_profile_code():
-    return (
-        random.choice(string.ascii_uppercase) +
-        str(random.randint(1, 9)) +
-        '-' +
-        ''.join(random.choices(string.ascii_uppercase + string.digits, k=2)) +
-        '-' +
-        ''.join(random.choices(string.ascii_uppercase + string.digits, k=2))
-    )
-
-
-
-# New view for email verification
-def verify_email(request):
-    token = request.GET.get('token')
-    if not token:
-        messages.error(request, 'Invalid verification link.')
-        return render(request, 'verify.html')
-
-    try:
-        user_profile = UserProfile.objects.get(verification_token=token, is_verified=False)
-        user_profile.is_verified = True
-        user_profile.verification_token = None  # Clear token after use
-        user_profile.save()
-        messages.success(request, 'Email verified! You can now log in.')
-        return render(request, 'verify.html')
-    except UserProfile.DoesNotExist:
-        messages.error(request, 'Invalid or expired verification link.')
-        return render(request, 'verify.html')
-
-# Modified login view to check verification
-"""def login_page(request):
-    if request.method == 'POST':
-        username = request.POST.get('username')
-        password = request.POST.get('password')
-        user = authenticate(request, username=username, password=password)
-        if user:
-            user_profile = UserProfile.objects.get(user=user)
-            if not user_profile.is_verified:
-                messages.error(request, 'Please verify your email before logging in.')
-                return render(request, 'login.html')
-            login(request, user)
-            messages.success(request, 'Login successful!')
-            return redirect('posts')
-        else:
-            messages.error(request, 'Invalid username or password.')
-    if request.user.is_authenticated:
-        return redirect('posts')
-    return render(request, 'login.html')"""
-
-# ... (rest of your views.py remains unchanged)
-
-import requests  # Add this at the top of your file
 
 @login_required
 @require_POST
@@ -687,16 +654,17 @@ def unlock_archived_messages(request, chat_room_id):
 </body>
 </html>
 """
-
-            from django.core.mail import EmailMultiAlternatives
-            email = EmailMultiAlternatives(
-                subject=subject,
-                body=text_content,
-                from_email="elyseniyonzima202@gmail.com",
-                to=[account_owner_email],
-            )
-            email.attach_alternative(html_content, "text/html")
-            email.send(fail_silently=False)
+            try:
+                email = EmailMultiAlternatives(
+                    subject=subject,
+                    body=text_content,
+                    from_email=settings.DEFAULT_FROM_EMAIL,
+                    to=[account_owner_email],
+                )
+                email.attach_alternative(html_content, "text/html")
+                email.send(fail_silently=False)
+            except Exception as e:
+                logger.error(f"Failed to send intruder alert email: {str(e)}")
 
             return JsonResponse({"success": False, "error": "Invalid profile code."})
 
@@ -707,6 +675,7 @@ def unlock_archived_messages(request, chat_room_id):
     except UserProfile.DoesNotExist:
         return JsonResponse({"success": False, "error": "Profile not found."})
     except Exception as e:
+        logger.error(f"Error unlocking archived messages: {str(e)}")
         return JsonResponse({"success": False, "error": str(e)})
 
 @login_required
@@ -727,79 +696,11 @@ def fetch_messages(request, chat_room_id):
 
     return JsonResponse({"success": True, "messages": messages_data})
 
-
-#banned accounts
+# --------------------
+# BANNED ACCOUNTS
+# --------------------
 def banned_account_page(request):
     return render(request, "BannedAccount.html")
-
-def unbann_accounts(request):
-    return render(request, 'account_unbanned.html')
-
-def account_banned(request):
-    return render(request, 'account_banned.html')
-
-
-
-
-from django.http import JsonResponse
-from django.views.decorators.http import require_POST
-from django.core.mail import send_mail
-from django.template.loader import render_to_string
-from django.utils.html import strip_tags
-from django.conf import settings
-from django.contrib.sessions.models import Session
-from django.utils import timezone
-from django.shortcuts import get_object_or_404
-from dashboard.models import ManageMember
-
-@require_POST
-def ban_user(request, member_id):
-    member = get_object_or_404(ManageMember, id=member_id)
-    user = member.member
-
-    member.status = False
-    member.save(update_fields=["status"])
-
-    # Kill active sessions
-    sessions = Session.objects.filter(expire_date__gte=timezone.now())
-    for session in sessions:
-        data = session.get_decoded()
-        if str(user.id) == str(data.get('_auth_user_id')):
-            session.delete()
-
-    # Email notification
-    subject = "Your Account Has Been Banned"
-    html_message = render_to_string('account_banned.html', {'user': user})
-    plain_message = strip_tags(html_message)
-    send_mail(subject, plain_message, settings.DEFAULT_FROM_EMAIL, [user.email],
-              html_message=html_message)
-
-    return JsonResponse({"success": True, "new_status": member.status})
-
-
-@require_POST
-def unban_user(request, member_id):
-    member = get_object_or_404(ManageMember, id=member_id)
-    user = member.member
-
-    member.status = True
-    member.save(update_fields=["status"])
-
-    subject = "Your Account Has Been Reactivated"
-    html_message = render_to_string('account_unbanned.html', {'user': user})
-    plain_message = strip_tags(html_message)
-    send_mail(subject, plain_message, settings.DEFAULT_FROM_EMAIL, [user.email],
-              html_message=html_message)
-
-    return JsonResponse({"success": True, "new_status": member.status})
-
-
-# views.py
-from django.shortcuts import render, redirect
-from django.contrib.auth.decorators import login_required
-from django.contrib.auth.models import User
-from django.contrib import messages
-from dashboard.models import Notification
 
 def banned_page(request):
     if request.method == 'POST':
@@ -836,7 +737,6 @@ def banned_page(request):
     
     return render(request, 'BannedAccount.html')
 
-
 def thank_you(request):
     return render(request, 'thank_you.html')
 
@@ -845,3 +745,49 @@ def unbann_accounts(request):
 
 def account_banned(request):
     return render(request, 'account_banned.html')
+
+@require_POST
+def ban_user(request, member_id):
+    member = get_object_or_404(ManageMember, id=member_id)
+    user = member.member
+
+    member.status = False
+    member.save(update_fields=["status"])
+
+    # Kill active sessions
+    sessions = Session.objects.filter(expire_date__gte=timezone.now())
+    for session in sessions:
+        data = session.get_decoded()
+        if str(user.id) == str(data.get('_auth_user_id')):
+            session.delete()
+
+    # Email notification
+    subject = "Your Account Has Been Banned"
+    html_message = render_to_string('account_banned.html', {'user': user})
+    plain_message = strip_tags(html_message)
+    try:
+        send_mail(subject, plain_message, settings.DEFAULT_FROM_EMAIL, [user.email],
+                  html_message=html_message)
+    except Exception as e:
+        logger.error(f"Failed to send ban notification email: {str(e)}")
+
+    return JsonResponse({"success": True, "new_status": member.status})
+
+@require_POST
+def unban_user(request, member_id):
+    member = get_object_or_404(ManageMember, id=member_id)
+    user = member.member
+
+    member.status = True
+    member.save(update_fields=["status"])
+
+    subject = "Your Account Has Been Reactivated"
+    html_message = render_to_string('account_unbanned.html', {'user': user})
+    plain_message = strip_tags(html_message)
+    try:
+        send_mail(subject, plain_message, settings.DEFAULT_FROM_EMAIL, [user.email],
+                  html_message=html_message)
+    except Exception as e:
+        logger.error(f"Failed to send unban notification email: {str(e)}")
+
+    return JsonResponse({"success": True, "new_status": member.status})
