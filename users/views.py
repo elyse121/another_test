@@ -113,7 +113,7 @@ def logout_page(request):
 
 # --------------------
 # SIGNUP + VERIFICATION (FIXED FOR REAL EMAIL SENDING)
-# -------------------
+# --------------------
 def signup_view(request):
     if request.method == 'POST':
         email = request.POST.get('email')
@@ -180,10 +180,8 @@ def signup_view(request):
             
             user_profile.save()
 
-            # Build dynamic verification link (WORKS ON RENDER)
-            current_site = request.get_host()
-            protocol = 'https'  # Render uses HTTPS
-            verification_link = f"{protocol}://{current_site}/verify/?token={user_profile.verification_token}"
+            # Build dynamic verification link
+            verification_link = request.build_absolute_uri(reverse('verify_email')) + f"?token={user_profile.verification_token}"
 
             # Send email with proper configuration
             try:
@@ -195,14 +193,14 @@ def signup_view(request):
                         f"Please verify your email by clicking this link: {verification_link}\n"
                         f"This link expires in 30 minutes."
                     ),
-                    from_email=settings.DEFAULT_FROM_EMAIL,
+                    from_email=settings.DEFAULT_FROM_EMAIL,  # Use from settings
                     recipient_list=[email],
-                    fail_silently=False,
+                    fail_silently=False,  # Changed to False to catch real errors
                 )
-                print(f"✅ Verification email sent to {email}")  # Will show in Render logs
+                logger.info(f"Verification email sent successfully to {email}")
                 
             except Exception as e:
-                print(f"❌ Failed to send verification email: {str(e)}")
+                logger.error(f"Failed to send verification email to {email}: {str(e)}")
                 # Don't delete user, just show error
                 error_msg = "Account created but failed to send verification email. Please contact support."
                 if request.headers.get("x-requested-with") == "XMLHttpRequest":
@@ -218,7 +216,7 @@ def signup_view(request):
             return redirect('login')
 
         except Exception as e:
-            print(f"❌ Error during user creation: {str(e)}")
+            logger.error(f"Error during user creation: {str(e)}")
             error_msg = "An error occurred during signup. Please try again."
             if request.headers.get("x-requested-with") == "XMLHttpRequest":
                 return JsonResponse({"success": False, "message": error_msg})
@@ -228,6 +226,8 @@ def signup_view(request):
     if request.user.is_authenticated:
         return redirect('posts')
     return render(request, 'signup.html')
+
+
 def verify_email(request):
     """Handle email verification"""
     token = request.GET.get('token')
